@@ -7,10 +7,11 @@ import pandas as pd
 import ete3
 
 class Tree:
-    def __init__(self, attr, val, root=False, ete3_node=None):
+    def __init__(self, attr, val, cond=None, root=False, ete3_node=None):
         self.attr = attr
         self.val = val
         self.root = root
+        self.cond = cond
         if root:
             self.ete3_node = ete3.Tree(name='Root')
         else:
@@ -19,7 +20,7 @@ class Tree:
         self.children = []
 
 
-    def add_child(self, attr, val, df=None, target=None, continuous=False):
+    def add_child(self, attr, val, cond=None, df=None, target=None, continuous=False):
         if attr is None:
             if not continuous:
                 distribution = round(len(df[df[target] == val]) / len(df), 2) * 100
@@ -40,13 +41,13 @@ class Tree:
             ete3_child.add_face(ete3.TextFace(msg),
                                 column=0, position='branch-right')
         elif attr is not None and len(self.children) == 0:
-            ete3_child.add_face(ete3.TextFace(msg.format('<')),
+            ete3_child.add_face(ete3.TextFace(msg.format('<=')),
                                 column=0, position='branch-right')
         elif attr is not None:
-            ete3_child.add_face(ete3.TextFace(msg.format('>=')),
+            ete3_child.add_face(ete3.TextFace(msg.format('>')),
                                 column=0, position='branch-right')
 
-        node = Tree(attr, val, ete3_node=ete3_child)
+        node = Tree(attr, val, cond, ete3_node=ete3_child)
         self.children.append(node)
 
         return node
@@ -95,26 +96,63 @@ class ID3:
         remaining_attrs = attrs[:best_attr_idx] + attrs[best_attr_idx+1:]
 
         if df[best_attr].dtype == np.dtype('O'): # Categorical values
+            cond = op.eq
             for val in df[best_attr].unique():
                 filtered_examples = df[df[best_attr] == val]
-                child = node.add_child(best_attr, val)
+                child = node.add_child(best_attr, val, cond)
                 self.build_tree(child, filtered_examples, target_attr, remaining_attrs)
         else: # Continuous values
             val = df[best_attr].median()
-            filtered_examples = df[df[best_attr] < val]
-            child = node.add_child(best_attr, val, continuous=True)
+            filtered_examples = df[df[best_attr] <= val]
+            child = node.add_child(best_attr, val, op.le, continuous=True)
             self.build_tree(child, filtered_examples, target_attr, remaining_attrs)
 
-            filtered_examples = df[df[best_attr] >= val]
-            child = node.add_child(best_attr, val, continuous=True)
+            filtered_examples = df[df[best_attr] > val]
+            child = node.add_child(best_attr, val, op.gt, continuous=True)
             self.build_tree(child, filtered_examples, target_attr, remaining_attrs)
+
+
+    def prune(self, df_val):
+        for child in self.root.children:
+            self.__prune(df_val, child)
+
+
+    def __prune(self, df_val, node):
+        for child in node.children:
+            if len(child.children) != 0: # Not a leaf
+                filtered_df_val = df_val[node.cond(df_val[node.attr], node.val)]
+                self.__prune(filtered_df_val, child)
+
+        current_score = self.score(df_val)
+
+        if len(df_val) == 0: # Validation data doesn't exist for this node
+            potential_score = .0
+        elif df_val[self.target].dtype == np.dtype('O'): # Categorical value
+            most_common_target = df_val[self.target].value_counts().idxmax()
+            potential_score = len(df_val[df_val[self.target] == most_common_target]) / len(df_val)
+        else:
+            median = df_val[self.target].median()
+            potential_score = len(df_val[self.target] <= median)  / len(df)
+
+        #print(node.attr, current_score, potential_score)
+        if current_score < potential_score: # Val is better when pruning
+            for child in node.children:
+                child.ete3_node.detach()
+            node.children = []
+
+            if df_val[self.target].dtype == np.dtype('O'): # Classification task
+                node.add_child(None, df_val[self.target].value_counts().idxmax(),
+                               df=df_val, target=self.target)
+            else: # Regression task
+                node.add_child(None, df_val[self.target].mean(), df=df_val,
+                               target=self.target, continuous=True)
 
 
 
     def predict(self, df_example):
         node = self.root
         while True:
-            if len(node.children) == 1 and len(node.children[0].children) == 0:
+            if (len(node.children) == 1 and len(node.children[0].children) == 0):
                 return node.children[0].val
 
             attr = node.children[0].attr
@@ -124,7 +162,7 @@ class ID3:
                         node = child
                         break
             else: # Continuous value
-                if df_example[attr] < node.children[0].val:
+                if df_example[attr] <= node.children[0].val:
                     node = node.children[0]
                 else:
                     node = node.children[1]
@@ -139,6 +177,9 @@ class ID3:
 
     def score(self, df):
         nb_elts = len(df)
+        if nb_elts == 0:
+            return .0
+
         good_preds = 0
         for i in range(nb_elts):
             pred, true = self.predict(df.iloc[i]), df.iloc[i][self.target]
@@ -170,6 +211,10 @@ class ID3:
     def compute_entropy(self, df, nb_elts, target_attr, attr):
         unique_vals = df[attr].unique()
         entropy = 0
+
+        if df[attr].dtype != np.dtype('O'):
+            raise Warning('Only Gini criterion supports continuous attributes.')
+
         for x in unique_vals:
             p = len(df[df[attr] == x]) / nb_elts
             entropy += -p * math.log2(p)
@@ -180,6 +225,9 @@ class ID3:
         attr_vals = list(df[attr].unique())
         target_vals = list(df[target_attr].unique())
         info_gain = 0
+
+        if df[attr].dtype != np.dtype('O'):
+            raise Warning('Only Gini criterion supports continuous attributes.')
 
         for (attr_val, target_val) in itertools.product(attr_vals, target_vals):
             pac = len(df[(df[attr] == attr_val) & (df[target_attr] == target_val)]) + 1e-8
@@ -194,6 +242,9 @@ class ID3:
     def compute_gain_ratio(self, df, nb_elts, target_attr, attr):
         info_gain = self.compute_info_gain(df, nb_elts, target_attr, attr)
         split_info = 0
+
+        if df[attr].dtype != np.dtype('O'):
+            raise Warning('Only Gini criterion supports continuous attributes.')
 
         for attr_val in list(df[attr].unique()):
             si = len(df[df[attr] == attr_val])
@@ -214,10 +265,10 @@ class ID3:
             # Split the data by its median as it is a better separator than
             # its mean.
             median = df[attr].median()
-            p = len(df[df[attr] < median]) / nb_elts
-            gini_impurity += p
+            p = len(df[df[attr] <= median]) / nb_elts
+            gini_impurity += p ** 2
 
-            p = len(df[df[attr] >= median]) / nb_elts
-            gini_impurity += p
+            p = len(df[df[attr] > median]) / nb_elts
+            gini_impurity += p ** 2
 
         return 1 - gini_impurity
